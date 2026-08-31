@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "barricador-client"
-version = "0.2.0"
+version = "0.3.0"
 description = "Barricador production-grade Python Server SDK (local evaluation, SSE sync, telemetry)"
 readme = "README.md"
 requires-python = ">=3.9"

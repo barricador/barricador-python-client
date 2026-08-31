@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 
 class Transport:
@@ -19,13 +19,35 @@ class Transport:
         return {"Authorization": f"Bearer {self._sdk_key}", "Accept": accept}
 
     def bootstrap(self, timeout: float = 5.0) -> Dict[str, Any]:
+        """Fetch the full ruleset unconditionally."""
+        _not_modified, _etag, body = self.bootstrap_conditional(None, timeout=timeout)
+        return body or {}
+
+    def bootstrap_conditional(
+        self, etag: Optional[str], timeout: float = 5.0
+    ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
+        """Fetch the ruleset, sending ``If-None-Match`` when ``etag`` is given.
+
+        Returns ``(not_modified, etag, body)``. On a 304 the body is ``None`` and the cached ruleset
+        is still current — that response costs the backend no flag reads, which is what makes polling
+        cheaper than holding an SSE stream open (an open stream bills server instance time for its
+        entire lifetime).
+        """
+        headers = self._headers("application/json")
+        if etag:
+            headers["If-None-Match"] = etag
         req = urllib.request.Request(
             f"{self._base_url}/api/v1/flags/bootstrap",
-            headers=self._headers("application/json"),
+            headers=headers,
             method="GET",
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return False, resp.headers.get("ETag"), json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 304:
+                return True, etag, None
+            raise
 
     def flush_metrics(self, events: List[Dict[str, Any]], timeout: float = 10.0) -> bool:
         body = json.dumps({"events": events}).encode("utf-8")

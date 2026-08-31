@@ -28,7 +28,8 @@ class AsyncBarricadorClient:
         sdk_key: str,
         base_url: str = "https://app.barricador.com",
         *,
-        streaming_enabled: bool = True,
+        streaming_enabled: bool = False,
+        poll_interval: float = 30.0,
         metrics_enabled: bool = True,
         metrics_flush_interval: float = 30.0,
         bootstrap_timeout: float = 5.0,
@@ -44,6 +45,8 @@ class AsyncBarricadorClient:
         self._metrics_enabled = metrics_enabled
         self._metrics_flush_interval = metrics_flush_interval
         self._bootstrap_timeout = bootstrap_timeout
+        self._poll_interval = poll_interval
+        self._etag: Optional[str] = None
         self._initial_reconnect_delay = initial_reconnect_delay
         self._max_reconnect_delay = max_reconnect_delay
 
@@ -51,6 +54,7 @@ class AsyncBarricadorClient:
         self._sse_conn: Optional[Any] = None
         self._sse_thread: Optional[threading.Thread] = None
         self._flush_task: Optional[asyncio.Task] = None
+        self._poll_task: Optional[asyncio.Task] = None
 
     @classmethod
     async def create(cls, sdk_key: str, base_url: str = "https://app.barricador.com", **kwargs: Any) -> "AsyncBarricadorClient":
@@ -63,6 +67,8 @@ class AsyncBarricadorClient:
         if self._streaming_enabled:
             self._sse_thread = threading.Thread(target=self._stream_loop, name="barricador-sse", daemon=True)
             self._sse_thread.start()
+        else:
+            self._poll_task = asyncio.create_task(self._poll_loop())
         if self._metrics_enabled:
             self._flush_task = asyncio.create_task(self._flush_loop())
 
@@ -100,11 +106,41 @@ class AsyncBarricadorClient:
 
     async def _safe_bootstrap(self) -> None:
         try:
-            resp = await asyncio.to_thread(self._transport.bootstrap, self._bootstrap_timeout)
+            _nm, etag, resp = await asyncio.to_thread(
+                self._transport.bootstrap_conditional, None, self._bootstrap_timeout
+            )
+            resp = resp or {}
             flags = {f["key"]: f for f in (resp.get("flags") or [])}
             self._store.replace_all(flags, int(resp.get("rulesVersion", 0)))
+            self._etag = etag
         except Exception as exc:  # noqa: BLE001
             logger.warning("Async bootstrap failed (%s); serving cached/defaults", exc)
+
+    async def _poll_loop(self) -> None:
+        """Refresh the ruleset on a fixed interval using a conditional GET.
+
+        The default sync mode. An unchanged poll is a 304 that occupies the backend for
+        milliseconds, whereas an open SSE stream bills backend instance time for its whole lifetime.
+        """
+        try:
+            while not self._closed.is_set():
+                # Jitter so N processes in a fleet don't poll in lockstep.
+                await asyncio.sleep(self._poll_interval + random.uniform(0, self._poll_interval / 10))
+                if self._closed.is_set():
+                    return
+                try:
+                    not_modified, etag, resp = await asyncio.to_thread(
+                        self._transport.bootstrap_conditional, self._etag, self._bootstrap_timeout
+                    )
+                    if not_modified or not resp:
+                        continue
+                    flags = {f["key"]: f for f in (resp.get("flags") or [])}
+                    self._store.replace_all(flags, int(resp.get("rulesVersion", 0)))
+                    self._etag = etag
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Async poll failed (%s); keeping cached ruleset", exc)
+        except asyncio.CancelledError:
+            raise
 
     def _stream_loop(self) -> None:
         delay = self._initial_reconnect_delay
@@ -156,6 +192,8 @@ class AsyncBarricadorClient:
         self._closed.set()
         if self._flush_task is not None:
             self._flush_task.cancel()
+        if self._poll_task is not None:
+            self._poll_task.cancel()
         if self._sse_conn is not None:
             self._sse_conn.close()
         await self.flush()

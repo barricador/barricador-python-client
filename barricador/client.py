@@ -19,9 +19,13 @@ class BarricadorClient:
     """Server SDK client.
 
     Evaluation methods are synchronous, in-memory, and never perform I/O or raise. A daemon thread
-    keeps the cache fresh via SSE (with exponential backoff on disconnect), and another daemon thread
-    flushes aggregated telemetry every ``metrics_flush_interval`` seconds. Use as a context manager
-    or call :meth:`close`.
+    keeps the cache fresh, and another daemon thread flushes aggregated telemetry every
+    ``metrics_flush_interval`` seconds. Use as a context manager or call :meth:`close`.
+
+    By default the cache is refreshed by a conditional poll every ``poll_interval`` seconds, so an
+    unchanged ruleset costs one 304. Pass ``streaming_enabled=True`` for near-instant propagation via
+    SSE — that holds a connection open, which is billed as continuous backend instance time, so it is
+    opt-in rather than the default.
     """
 
     def __init__(
@@ -29,7 +33,8 @@ class BarricadorClient:
         sdk_key: str,
         base_url: str = "https://app.barricador.com",
         *,
-        streaming_enabled: bool = True,
+        streaming_enabled: bool = False,
+        poll_interval: float = 30.0,
         metrics_enabled: bool = True,
         metrics_flush_interval: float = 30.0,
         bootstrap_timeout: float = 5.0,
@@ -44,6 +49,8 @@ class BarricadorClient:
         self._metrics_enabled = metrics_enabled
         self._metrics_flush_interval = metrics_flush_interval
         self._bootstrap_timeout = bootstrap_timeout
+        self._poll_interval = poll_interval
+        self._etag: Optional[str] = None
         self._initial_reconnect_delay = initial_reconnect_delay
         self._max_reconnect_delay = max_reconnect_delay
 
@@ -54,6 +61,9 @@ class BarricadorClient:
         if streaming_enabled:
             self._sse_thread = threading.Thread(target=self._stream_loop, name="barricador-sse", daemon=True)
             self._sse_thread.start()
+        else:
+            self._poll_thread = threading.Thread(target=self._poll_loop, name="barricador-poll", daemon=True)
+            self._poll_thread.start()
         if metrics_enabled:
             self._flush_thread = threading.Thread(target=self._flush_loop, name="barricador-metrics", daemon=True)
             self._flush_thread.start()
@@ -96,12 +106,39 @@ class BarricadorClient:
 
     def _safe_bootstrap(self) -> None:
         try:
-            resp = self._transport.bootstrap(timeout=self._bootstrap_timeout)
+            _nm, etag, resp = self._transport.bootstrap_conditional(None, timeout=self._bootstrap_timeout)
+            resp = resp or {}
             flags = {f["key"]: f for f in (resp.get("flags") or [])}
             self._store.replace_all(flags, int(resp.get("rulesVersion", 0)))
+            self._etag = etag
             logger.debug("Barricador bootstrap: %d flags (v%s)", len(flags), resp.get("rulesVersion"))
         except Exception as exc:  # noqa: BLE001 - never fatal
             logger.warning("Barricador bootstrap failed (%s); serving cached/defaults", exc)
+
+    def _poll_loop(self) -> None:
+        """Refresh the ruleset on a fixed interval using a conditional GET.
+
+        This is the default sync mode. It trades propagation latency (up to one interval) for cost:
+        an open SSE stream bills backend instance time continuously, whereas an unchanged poll is a
+        304 that occupies the server for milliseconds. A failed poll leaves the cache intact.
+        """
+        while not self._closed.wait(self._jittered_interval()):
+            try:
+                not_modified, etag, resp = self._transport.bootstrap_conditional(
+                    self._etag, timeout=self._bootstrap_timeout
+                )
+                if not_modified or not resp:
+                    continue
+                flags = {f["key"]: f for f in (resp.get("flags") or [])}
+                self._store.replace_all(flags, int(resp.get("rulesVersion", 0)))
+                self._etag = etag
+                logger.debug("Barricador poll: %d flags (v%s)", len(flags), resp.get("rulesVersion"))
+            except Exception as exc:  # noqa: BLE001 - never fatal
+                logger.debug("Barricador poll failed (%s); keeping cached ruleset", exc)
+
+    def _jittered_interval(self) -> float:
+        """Spread polls across a fleet so N processes don't hit the backend in lockstep."""
+        return self._poll_interval + random.uniform(0, self._poll_interval / 10)
 
     def _stream_loop(self) -> None:
         delay = self._initial_reconnect_delay
